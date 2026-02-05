@@ -1,0 +1,48 @@
+# Trusted domains whitelist
+# Domains listed here will be automatically approved for WebFetch
+# This file is automatically updated when you approve new domains
+
+# Code hosting
+github.com
+githubusercontent.com
+raw.githubusercontent.com
+gist.github.com
+gitlab.com
+bitbucket.org
+
+# Package registries
+pypi.org
+files.pythonhosted.org
+npmjs.com
+registry.npmjs.org
+crates.io
+rubygems.org
+pkg.go.dev
+
+# Documentation
+docs.python.org
+developer.mozilla.org
+devdocs.io
+readthedocs.io
+readthedocs.org
+
+# Community
+stackoverflow.com
+stackexchange.com
+reddit.com
+
+# AI/ML
+anthropic.com
+openai.com
+huggingface.co
+modelscope.cn
+
+# Cloud providers
+aws.amazon.com
+cloud.google.com
+azure.microsoft.com
+
+# Other trusted
+wikipedia.org
+medium.com
+dev.to
