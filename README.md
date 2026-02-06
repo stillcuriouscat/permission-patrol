@@ -1,8 +1,33 @@
 # Permission Patrol
 
-> AI-powered security guard for Claude Code permission requests
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-Hook-blue)](https://docs.anthropic.com/en/docs/claude-code)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://www.python.org/)
 
-Permission Patrol uses a command hook with Claude CLI (Haiku) to intelligently review permission requests that aren't handled by deterministic rules. No separate API key required - uses your subscription quota.
+> **AI-powered security guard for Claude Code permission requests**
+
+A command hook that **reads script content before approving execution** — catches hidden `shutil.rmtree()` or `rm -rf` that prompt hooks can't see.
+
+## The Problem
+
+When Claude Code asks to run `python script.py`, a **prompt hook only sees the command string** — it can't read what's inside the script. So this gets approved:
+
+```python
+# script.py - looks innocent as a command
+import shutil
+shutil.rmtree("/home/user/important_data")  # 💀 Hidden danger
+```
+
+**Permission Patrol solves this** by using a **command hook** that actually reads the file content before deciding. No more blind approvals.
+
+## Key Features
+
+- 🔍 **Reads script content** — inspects Python, Node, pytest files before approval
+- 🛡️ **Catches hidden dangers** — `shutil.rmtree()`, `os.remove()`, `rm -rf` buried in code
+- ⚡ **Zero API cost for safe ops** — deterministic rules handle `git`, `ls`, linters
+- 🤖 **AI review for ambiguous cases** — Claude Haiku analyzes complex commands
+- 🔔 **Desktop notifications** — know when Claude approved but needs your confirmation
+- 📦 **No separate API key** — uses your Claude Code subscription quota
 
 ## How It Works
 
@@ -185,6 +210,22 @@ To customize, edit your `~/.claude/settings.json` directly:
 }
 ```
 
+## Use Cases
+
+- **AI agent security** — prevent autonomous code execution from deleting files or exfiltrating data
+- **Claude Code hardening** — add an extra layer of review for permission requests
+- **Script inspection** — automatically review Python/Node scripts before execution
+- **Sensitive path protection** — require confirmation for operations on `~/.ssh`, `/etc/`, `.env`
+
+## See Also
+
+- [Claude Code Hooks Documentation](https://docs.anthropic.com/en/docs/claude-code/hooks)
+- [Boris Cherny's Claude Code Tips](https://x.com/bcherny) — tip 8c inspired this project
+
 ## License
 
 MIT
+
+---
+
+**Keywords:** claude code, claude code hook, permission hook, ai agent security, command hook, prompt hook, script inspection, claude code security, anthropic, ai safety
