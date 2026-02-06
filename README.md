@@ -2,7 +2,7 @@
 
 > AI-powered security guard for Claude Code permission requests
 
-Permission Patrol uses a command hook with Opus API to intelligently review permission requests that aren't handled by deterministic rules.
+Permission Patrol uses a command hook with Claude CLI (Haiku) to intelligently review permission requests that aren't handled by deterministic rules. No separate API key required - uses your subscription quota.
 
 ## How It Works
 
@@ -19,7 +19,7 @@ Request arrives
          │
          ├─ PHASE 1: Dangerous regex? ──→ Deny
          │
-         ├─ PHASE 2: Script execution? ──→ Opus reviews script content
+         ├─ PHASE 2: Script execution? ──→ Claude reviews script content
          │   (python xxx.py, pytest, node...)
          │
          └─ PHASE 3: Other cases ──→ Ask user
@@ -36,23 +36,23 @@ Request arrives
 | Linters (`ruff`, `mypy`, `eslint`) | ✅ Allow (settings.json) |
 | Trusted domains (`github.com`...) | ✅ Allow (settings.json) |
 | GitHub CLI (`gh *`) | ✅ Allow (settings.json) |
-| Run Python/pytest | 🤖 Opus reads script, checks for dangerous code |
-| Write code with `os.remove` etc. | 🤖 Opus reviews |
+| Run Python/pytest | 🤖 Claude reads script, checks for dangerous code |
+| Write code with `os.remove` etc. | 🤖 Claude reviews |
 | Unknown operations | 👤 Ask user |
 
-## Why API Key?
+## Why Command Hook?
 
 Claude Code supports two types of hooks for AI-powered review:
 
 | | `type: "prompt"` | `type: "command"` (this project) |
 |---|---|---|
-| Cost | Uses subscription quota | Requires separate API key |
+| Cost | Uses subscription quota | Uses subscription quota (via CLI) |
 | Setup | JSON config only | Python script |
 | **Can read script files** | ❌ No | ✅ Yes |
 
 **The key difference:** `prompt` hooks can only see the command string (e.g., `python3 script.py`). They cannot read what's inside `script.py`.
 
-Permission Patrol uses a `command` hook so Opus can **read the actual script content** before deciding. This catches dangerous code like:
+Permission Patrol uses a `command` hook that calls Claude CLI, so it can **read the actual script content** before deciding. This catches dangerous code like:
 
 ```python
 # script.py looks innocent as a command, but contains:
@@ -62,25 +62,14 @@ shutil.rmtree("/home/user/important_data")
 
 A `prompt` hook would approve `python3 script.py` because the command looks safe. Permission Patrol reads the file and denies it.
 
-**Trade-off:** You pay for API calls, but get deeper security inspection.
-
 ## Requirements
 
 - Claude Code with hooks support
-- Anthropic API key (stored in `~/.claude/anthropic-api-key`)
-- `anthropic` Python SDK (`pip install anthropic`)
+- That's it! Uses Claude CLI internally (subscription quota)
 
 ## Installation
 
-### 1. Set up API key
-
-```bash
-# Create API key file (chmod 600 for security)
-echo "sk-ant-xxxxx" > ~/.claude/anthropic-api-key
-chmod 600 ~/.claude/anthropic-api-key
-```
-
-### 2. Merge permissions into settings.json
+### 1. Merge permissions into settings.json
 
 Add the `allow` and `deny` rules from `permissions.json` to your `~/.claude/settings.json`:
 
@@ -102,7 +91,7 @@ Add the `allow` and `deny` rules from `permissions.json` to your `~/.claude/sett
 }
 ```
 
-### 3. Add hook to settings.json
+### 2. Add hook to settings.json
 
 ```json
 {
@@ -123,22 +112,22 @@ Add the `allow` and `deny` rules from `permissions.json` to your `~/.claude/sett
 }
 ```
 
-### 4. Restart Claude Code
+### 3. Restart Claude Code
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `permission-guard.py` | Main hook script - calls Opus API for intelligent review |
+| `permission-guard.py` | Main hook script - calls Claude CLI for intelligent review |
 | `permissions.json` | Reference allow/deny rules to merge into settings.json |
 
-## How Opus Reviews Scripts
+## How Claude Reviews Scripts
 
 When you run `python3 script.py` or `pytest`:
 
 1. Hook reads the script file content
-2. Sends content + request info to Opus
-3. Opus checks for:
+2. Sends content + request info to Claude CLI (Haiku)
+3. Claude checks for:
    - File deletion (`shutil.rmtree`, `os.remove`)
    - Data upload (`requests.post`, socket connections)
    - Credential access (`~/.ssh`, `.env`)

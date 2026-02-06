@@ -2,19 +2,21 @@
 """
 Permission Guard Hook for Claude Code
 ======================================
-This script runs as a PermissionRequest hook, using Opus 4.5 to review permission requests.
+This script runs as a PermissionRequest hook, using Claude CLI (Haiku) to review permission requests.
+Uses subscription quota via CLI - no separate API key required.
 
 Security Policy:
 - Delete operations: Deny
 - Upload operations: Deny
 - Access paths outside project: Ask user
 - Trusted domains: Auto-approve
-- Other cases: Call Opus for review
+- Other cases: Call Claude CLI for review
 """
 
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -27,20 +29,6 @@ def log_debug(msg: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     with open(DEBUG_LOG, "a") as f:
         f.write(f"[{timestamp}] {msg}\n")
-
-# ============================================================================
-# Configuration
-# ============================================================================
-
-# API key file path (chmod 600 for security)
-API_KEY_FILE = Path.home() / ".claude" / "anthropic-api-key"
-
-
-def load_api_key() -> str | None:
-    """Load API key from file."""
-    if API_KEY_FILE.exists():
-        return API_KEY_FILE.read_text().strip()
-    return None
 
 # Sensitive path patterns (accessing these requires user confirmation)
 SENSITIVE_PATHS = [
@@ -79,7 +67,7 @@ DANGEROUS_PATTERNS = [
     r"/dev/tcp/",
 ]
 
-# Dangerous patterns in code (reference for Opus review)
+# Dangerous patterns in code (reference for Claude review)
 CODE_DANGER_PATTERNS = [
     r"os\.remove",
     r"os\.unlink",
@@ -148,17 +136,11 @@ def has_code_danger_patterns(code: str) -> list:
 
 
 # ============================================================================
-# Opus API Review
+# Claude CLI Review
 # ============================================================================
 
-def call_opus_for_review(request: dict, script_content: str = "") -> dict:
-    """Call Opus 4.5 for intelligent security review."""
-    try:
-        import anthropic
-    except ImportError:
-        # If anthropic not installed, skip Opus review
-        return {"decision": "ask", "reason": "anthropic SDK not installed, cannot perform intelligent review"}
-
+def call_claude_for_review(request: dict, script_content: str = "") -> dict:
+    """Call Claude CLI (Haiku) for intelligent security review. Uses subscription quota."""
     tool_name = request.get("tool_name", "Unknown")
     tool_input = request.get("tool_input", {})
     cwd = request.get("cwd", "")
@@ -168,7 +150,7 @@ def call_opus_for_review(request: dict, script_content: str = "") -> dict:
     if script_content:
         script_section = f"""
 ## Script Content
-```python
+```
 {script_content}
 ```
 """
@@ -203,22 +185,22 @@ or {{"decision": "deny", "reason": "reason for denial"}}
 """
 
     try:
-        api_key = load_api_key()
-        if not api_key:
-            log_debug("ERROR: API key not found")
-            return {"decision": "ask", "reason": "API key not found in ~/.claude/anthropic-api-key"}
+        log_debug("Calling Claude CLI (haiku)...")
 
-        log_debug("Calling Opus API...")
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model="claude-opus-4-5-20251101",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
+        # Call claude CLI with print mode
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--model", "haiku", "--output-format", "text"],
+            capture_output=True,
+            text=True,
+            timeout=30
         )
 
-        # Extract text content
-        text = response.content[0].text.strip()
-        log_debug(f"Opus response: {text[:200]}")
+        if result.returncode != 0:
+            log_debug(f"CLI error: {result.stderr}")
+            return {"decision": "ask", "reason": f"CLI error: {result.stderr}"}
+
+        text = result.stdout.strip()
+        log_debug(f"Claude response: {text[:200]}")
 
         # Try to parse JSON (may be wrapped in markdown)
         if "```" in text:
@@ -227,16 +209,24 @@ or {{"decision": "deny", "reason": "reason for denial"}}
             if match:
                 text = match.group(1)
 
-        result = json.loads(text)
-        log_debug(f"Opus decision: {result}")
-        return result
+        # Find JSON object in response
+        json_match = re.search(r'\{[^{}]*"decision"[^{}]*\}', text)
+        if json_match:
+            text = json_match.group(0)
 
+        parsed = json.loads(text)
+        log_debug(f"Claude decision: {parsed}")
+        return parsed
+
+    except subprocess.TimeoutExpired:
+        log_debug("ERROR: CLI timeout")
+        return {"decision": "ask", "reason": "CLI timeout"}
     except json.JSONDecodeError:
-        log_debug("ERROR: Could not parse Opus response")
-        return {"decision": "ask", "reason": "Could not parse Opus response"}
-    except anthropic.APIError as e:
-        log_debug(f"ERROR: Opus API error: {e}")
-        return {"decision": "ask", "reason": f"Opus API error: {e}"}
+        log_debug(f"ERROR: Could not parse response: {text[:100]}")
+        return {"decision": "ask", "reason": "Could not parse Claude response"}
+    except FileNotFoundError:
+        log_debug("ERROR: claude CLI not found")
+        return {"decision": "ask", "reason": "claude CLI not found in PATH"}
     except Exception as e:
         log_debug(f"ERROR: Review error: {e}")
         return {"decision": "ask", "reason": f"Review error: {e}"}
@@ -353,18 +343,18 @@ def main():
             except Exception as e:
                 log_debug(f"Could not read script: {e}")
 
-            log_debug("Calling Opus for script review...")
-            result = call_opus_for_review(request, script_content)
+            log_debug("Calling Claude for script review...")
+            result = call_claude_for_review(request, script_content)
             decision = result.get("decision", "ask")
             reason = result.get("reason", "")
 
-            log_debug(f"Opus decision: {decision}, reason: {reason}")
+            log_debug(f"Claude decision: {decision}, reason: {reason}")
             if decision == "allow":
                 allow()
             elif decision == "deny":
-                deny(f"⛔ Opus: {reason}")
+                deny(f"⛔ Claude: {reason}")
             else:
-                log_debug("Opus unsure, asking user")
+                log_debug("Claude unsure, asking user")
                 ask_user()
             return
 
@@ -374,18 +364,18 @@ def main():
         danger_patterns = has_code_danger_patterns(content)
         if danger_patterns:
             log_debug(f"Dangerous code patterns in Write/Edit: {danger_patterns}")
-            log_debug("Calling Opus for code review...")
-            result = call_opus_for_review(request)
+            log_debug("Calling Claude for code review...")
+            result = call_claude_for_review(request)
             decision = result.get("decision", "ask")
             reason = result.get("reason", "")
 
-            log_debug(f"Opus decision: {decision}, reason: {reason}")
+            log_debug(f"Claude decision: {decision}, reason: {reason}")
             if decision == "allow":
                 allow()
             elif decision == "deny":
-                deny(f"⛔ Opus: {reason}")
+                deny(f"⛔ Claude: {reason}")
             else:
-                log_debug("Opus unsure, asking user")
+                log_debug("Claude unsure, asking user")
                 ask_user()
             return
 
