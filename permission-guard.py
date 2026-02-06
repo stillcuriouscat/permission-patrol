@@ -26,6 +26,16 @@ from urllib.parse import urlparse
 # Whitelist file path (auto-grows over time)
 TRUSTED_DOMAINS_FILE = Path(__file__).parent / "trusted-domains.txt"
 
+# API key file path (chmod 600 for security)
+API_KEY_FILE = Path.home() / ".claude" / "anthropic-api-key"
+
+
+def load_api_key() -> str | None:
+    """Load API key from file."""
+    if API_KEY_FILE.exists():
+        return API_KEY_FILE.read_text().strip()
+    return None
+
 # Sensitive path patterns (accessing these requires user confirmation)
 SENSITIVE_PATHS = [
     r"^/etc/",
@@ -197,7 +207,10 @@ or {{"decision": "deny", "reason": "reason for denial"}}
 """
 
     try:
-        client = anthropic.Anthropic()
+        api_key = load_api_key()
+        if not api_key:
+            return {"decision": "ask", "reason": "API key not found in ~/.claude/anthropic-api-key"}
+        client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model="claude-opus-4-5-20250929",
             max_tokens=500,

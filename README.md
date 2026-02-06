@@ -1,100 +1,77 @@
-# 🚔 Permission Patrol
+# Permission Patrol
 
 > AI-powered security guard for Claude Code permission requests
 
-Permission Patrol is a Claude Code hook that uses **Opus 4.5** to intelligently review permission requests, automatically approving safe operations and blocking dangerous ones.
+Permission Patrol combines Claude Code's built-in permissions with an Opus agent hook for intelligent security review. **No API key required** - uses your Claude Code subscription.
+
+## How It Works
+
+```
+Request arrives
+    │
+    ├─ In permissions.deny? ──→ Reject immediately (no quota used)
+    │   (rm -rf, curl POST, scp...)
+    │
+    ├─ In permissions.allow? ──→ Pass immediately (no quota used)
+    │   (git status, ls, Read, ruff...)
+    │
+    └─ Neither? ──→ Opus agent reviews
+         │
+         ├─ If running a script ──→ Read script content, check for dangerous code
+         │
+         └─ Make decision: allow / deny / ask
+```
 
 ## Features
 
 | Operation | Handling |
 |-----------|----------|
-| Delete files (`rm`, `unlink`) | ❌ Auto-deny |
-| Upload data (`curl POST`, `scp` to remote) | ❌ Auto-deny |
-| Access trusted domains | ✅ Auto-approve |
-| Access unknown domains | ⏸️ Ask user (auto-add to whitelist after approval) |
-| Access paths outside project | ⏸️ Ask user |
-| Run code with dangerous patterns | 🤖 Opus 4.5 reviews |
-
-## How It Works
-
-```
-┌─────────────────────────────────────────────┐
-│           Claude Code Request               │
-└──────────────────┬──────────────────────────┘
-                   ↓
-┌─────────────────────────────────────────────┐
-│          permission-guard.py                │
-├─────────────────────────────────────────────┤
-│  1. Quick pattern check (regex)             │
-│  2. Trusted domain whitelist                │
-│  3. Project path validation                 │
-│  4. Opus 4.5 deep analysis                  │
-└──────────────────┬──────────────────────────┘
-                   ↓
-           allow / deny / ask
-```
-
-### Self-Learning Domain Whitelist
-
-When you approve a WebFetch request for a new domain, it's automatically added to the whitelist. Next time, any page on that domain will be auto-approved.
-
-```
-First visit to example.com
-    → Ask user for permission
-    → User approves
-    → Domain added to trusted-domains.txt
-
-Second visit to example.com/any-page
-    → Auto-approved ✅
-```
+| Delete files (`rm -rf`, `shred`) | ❌ Reject |
+| Upload data (`curl POST`, `scp`) | ❌ Reject |
+| Read-only ops (`ls`, `cat`, `Read`) | ✅ Pass |
+| Linters (`ruff`, `mypy`, `eslint`) | ✅ Pass |
+| Trusted domains (`github.com`, `pypi.org`) | ✅ Pass |
+| git push | ⏸️ Opus reviews → Ask user |
+| Run Python/pytest | 🤖 Opus reads script, checks for dangerous code |
+| Unknown operations | 🤖 Opus decides |
 
 ## Installation
 
-### 1. Clone the repository
+### 1. Merge permissions.json into settings.json
+
+Merge the `deny` and `allow` rules from `permissions.json` into your `~/.claude/settings.json`:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/permission-patrol.git
-cd permission-patrol
+cat permissions.json
 ```
 
-### 2. Install dependencies
+### 2. Merge hooks.json into settings.json
 
-```bash
-pip install anthropic
-```
+Merge the hooks configuration from `hooks.json` into `~/.claude/settings.json`.
 
-### 3. Set up your API key
-
-```bash
-export ANTHROPIC_API_KEY="your-api-key"
-```
-
-### 4. Configure Claude Code hooks
-
-Add the following to your `~/.claude/settings.json`:
+### 3. Final settings.json Structure
 
 ```json
 {
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf *)",
+      ...
+    ],
+    "allow": [
+      "Read(*)",
+      "Bash(git status *)",
+      ...
+    ]
+  },
   "hooks": {
     "PermissionRequest": [
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "python3 /path/to/permission-patrol/permission-guard.py",
-            "timeout": 120
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "WebFetch",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /path/to/permission-patrol/auto-whitelist-domain.py",
-            "timeout": 10
+            "type": "agent",
+            "model": "opus",
+            ...
           }
         ]
       }
@@ -103,78 +80,55 @@ Add the following to your `~/.claude/settings.json`:
 }
 ```
 
-### 5. Restart Claude Code
-
-Hooks are loaded at startup, so you need to restart Claude Code for changes to take effect.
+### 4. Restart Claude Code
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `permission-guard.py` | Main PermissionRequest hook - reviews all permission requests |
-| `auto-whitelist-domain.py` | PostToolUse hook - auto-adds approved domains to whitelist |
-| `trusted-domains.txt` | Domain whitelist (grows automatically) |
+| `permissions.json` | Deterministic rules (direct allow/deny, no quota used) |
+| `hooks.json` | Opus agent hook (intelligent review, uses subscription quota) |
 
-## Configuration
+## Opus Agent Capabilities
 
-### Trusted Domains
+When a request reaches the agent, it will:
 
-Edit `trusted-domains.txt` to add/remove trusted domains:
+1. **Analyze the request** - Understand what operation is being performed
+2. **Inspect script content** - If running `python xxx.py` or `pytest`, use Read tool to check:
+   - File deletion operations
+   - HTTP upload/data exfiltration
+   - Command injection risks
+   - Credential/key access
+   - Network connections
+3. **Make a decision** - allow / deny / ask
 
-```
-# Code hosting
-github.com
-gitlab.com
+## Customization
 
-# Package registries
-pypi.org
-npmjs.com
+### Add Trusted Domains
 
-# Your custom domains
-your-internal-site.com
-```
+Edit `permissions.json`, add to `allow`:
 
-### Security Rules
-
-The following patterns are **always denied** (in `permission-guard.py`):
-
-- `rm` commands targeting `/`, `~`, or `/home`
-- `curl` with POST/upload flags
-- `scp`/`rsync` to remote hosts
-- `mkfs`, `dd` to disk devices
-- Reverse shell patterns (`nc -e`, `bash -i`, `/dev/tcp`)
-
-## Testing
-
-```bash
-# Test dangerous command detection (should be denied)
-echo '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"/home/user"}' | python3 permission-guard.py
-
-# Test trusted domain (should be allowed)
-echo '{"tool_name":"WebFetch","tool_input":{"url":"https://github.com/test"},"cwd":"/home/user"}' | python3 permission-guard.py
-
-# Test unknown domain (should ask user - no output)
-echo '{"tool_name":"WebFetch","tool_input":{"url":"https://unknown.com"},"cwd":"/home/user"}' | python3 permission-guard.py
+```json
+"WebFetch(url: https://your-trusted-domain.com/*)"
 ```
 
-## Debugging
+### Add Dangerous Commands
 
-```bash
-# Run Claude Code with debug output
-claude --debug
+Edit `permissions.json`, add to `deny`:
+
+```json
+"Bash(your-dangerous-command *)"
 ```
+
+### Adjust Agent Behavior
+
+Edit the prompt in `hooks.json` to modify review rules.
 
 ## Requirements
 
-- Python 3.8+
-- `anthropic` Python SDK
 - Claude Code with hooks support
-- Anthropic API key (for Opus 4.5 reviews)
+- Claude Code subscription (Pro/Max)
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
