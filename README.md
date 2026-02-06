@@ -17,12 +17,20 @@ Request arrives
     │
     └─ Neither? ──→ permission-guard.py hook
          │
-         ├─ PHASE 1: Dangerous regex? ──→ Deny
+         ├─ PHASE 1: Dangerous regex? ──→ Deny immediately
+         │   (pipe to nc, encoded exfiltration...)
          │
          ├─ PHASE 2: Script execution? ──→ Claude reviews script content
          │   (python xxx.py, pytest, node...)
+         │   ├─ Claude deny ──→ Deny
+         │   ├─ Claude allow + in project ──→ Allow
+         │   └─ Claude allow + outside project ──→ Ask user (double confirm)
          │
-         └─ PHASE 3: Other cases ──→ Ask user
+         └─ PHASE 3: Other cases ──→ Claude reviews first
+             ├─ Claude deny ──→ Deny
+             ├─ Claude allow + in project ──→ Allow
+             ├─ Claude allow + sensitive path ──→ Ask user (double confirm)
+             └─ Claude allow + outside project ──→ Ask user (double confirm)
 ```
 
 ## Features
@@ -31,14 +39,16 @@ Request arrives
 |-----------|----------|
 | Delete files (`rm -rf`, `shred`) | ❌ Deny (settings.json) |
 | Upload data (`curl POST`, `scp`) | ❌ Deny (settings.json) |
+| Pipe to nc (`\| nc host port`) | ❌ Deny (regex) |
 | GitHub delete (`gh repo delete`) | ❌ Deny (settings.json) |
 | Read-only ops (`ls`, `cat`, `Read`) | ✅ Allow (settings.json) |
 | Linters (`ruff`, `mypy`, `eslint`) | ✅ Allow (settings.json) |
 | Trusted domains (`github.com`...) | ✅ Allow (settings.json) |
 | GitHub CLI (`gh *`) | ✅ Allow (settings.json) |
-| Run Python/pytest | 🤖 Claude reads script, checks for dangerous code |
-| Write code with `os.remove` etc. | 🤖 Claude reviews |
-| Unknown operations | 👤 Ask user |
+| Run Python/pytest (in project) | 🤖 Claude reviews → auto allow/deny |
+| Run script (outside project) | 🤖 Claude reviews → user confirms |
+| Sensitive paths (`/etc/`, `~/.ssh/`) | 🤖 Claude reviews → user confirms |
+| Complex Bash commands | 🤖 Claude reviews → auto or user confirms |
 
 ## Why Command Hook?
 
@@ -141,6 +151,19 @@ Logs are written to `/tmp/permission-guard.log`:
 ```bash
 tail -f /tmp/permission-guard.log
 ```
+
+## Desktop Notifications (Linux)
+
+On Linux, when Claude approves but user confirmation is still needed (outside project / sensitive path), a desktop notification is sent via `notify-send`:
+
+```
+✅ Claude approved, but path outside project:
+/etc/hostname
+
+Please confirm.
+```
+
+This helps you know Claude has already reviewed the request before you see the confirmation dialog.
 
 ## Customization
 
