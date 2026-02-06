@@ -40,6 +40,30 @@ Request arrives
 | Write code with `os.remove` etc. | 🤖 Opus reviews |
 | Unknown operations | 👤 Ask user |
 
+## Why API Key?
+
+Claude Code supports two types of hooks for AI-powered review:
+
+| | `type: "prompt"` | `type: "command"` (this project) |
+|---|---|---|
+| Cost | Uses subscription quota | Requires separate API key |
+| Setup | JSON config only | Python script |
+| **Can read script files** | ❌ No | ✅ Yes |
+
+**The key difference:** `prompt` hooks can only see the command string (e.g., `python3 script.py`). They cannot read what's inside `script.py`.
+
+Permission Patrol uses a `command` hook so Opus can **read the actual script content** before deciding. This catches dangerous code like:
+
+```python
+# script.py looks innocent as a command, but contains:
+import shutil
+shutil.rmtree("/home/user/important_data")
+```
+
+A `prompt` hook would approve `python3 script.py` because the command looks safe. Permission Patrol reads the file and denies it.
+
+**Trade-off:** You pay for API calls, but get deeper security inspection.
+
 ## Requirements
 
 - Claude Code with hooks support
