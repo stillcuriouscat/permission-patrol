@@ -2,15 +2,16 @@
 """
 Permission Guard Hook for Claude Code
 ======================================
-This script runs as a PermissionRequest hook, using Claude CLI (Haiku) to review permission requests.
+This script runs as a PermissionRequest hook, using Claude CLI (Opus) to review permission requests.
 Uses subscription quota via CLI - no separate API key required.
 
-Security Policy:
-- Delete operations: Deny
-- Upload operations: Deny
-- Access paths outside project: Ask user
-- Trusted domains: Auto-approve
-- Other cases: Call Claude CLI for review
+Security Architecture:
+- Phase 0: User-interactive tools (ExitPlanMode, AskUserQuestion) → pass to user
+- Phase 1: Dangerous regex patterns → auto deny (no API call)
+- Phase 2: Outside project / sensitive paths → Opus review + user confirmation
+- Phase 3: Inside project → Opus review, Claude can auto-approve
+
+Key principle: Claude can deny on behalf of the user, but NEVER approve outside-project operations.
 """
 
 import json
@@ -21,8 +22,10 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-# Debug log file
-DEBUG_LOG = Path("/tmp/permission-guard.log")
+# Debug log file - use XDG_STATE_HOME or ~/.local/state to avoid /tmp symlink attacks
+_state_dir = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "permission-patrol"
+_state_dir.mkdir(parents=True, exist_ok=True)
+DEBUG_LOG = _state_dir / "permission-guard.log"
 
 def log_debug(msg: str):
     """Write debug message to log file."""
@@ -93,19 +96,17 @@ CODE_DANGER_PATTERNS = [
 def is_path_in_project(path: str, cwd: str, additional_dirs: list) -> bool:
     """Check if path is within project scope."""
     try:
-        # Expand ~ and environment variables
-        path = os.path.expanduser(os.path.expandvars(path))
-        path = os.path.abspath(path)
+        from pathlib import PurePath
+        resolved = PurePath(os.path.abspath(os.path.expanduser(os.path.expandvars(path))))
 
         # Check if under cwd
-        if path.startswith(os.path.abspath(cwd)):
+        if resolved.is_relative_to(os.path.abspath(cwd)):
             return True
 
         # Check if under additionalDirectories
         for add_dir in additional_dirs:
-            add_dir = os.path.expanduser(os.path.expandvars(add_dir))
-            add_dir = os.path.abspath(add_dir)
-            if path.startswith(add_dir):
+            add_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(add_dir)))
+            if resolved.is_relative_to(add_dir):
                 return True
 
         return False
@@ -115,28 +116,29 @@ def is_path_in_project(path: str, cwd: str, additional_dirs: list) -> bool:
 
 def is_sensitive_path(path: str) -> bool:
     """Check if path is sensitive."""
-    path = os.path.expanduser(path)
-    for pattern in SENSITIVE_PATHS:
-        if re.search(pattern, path, re.IGNORECASE):
-            return True
-    return False
+    expanded = os.path.expanduser(path)
+    # Also construct tilde-relative path (e.g. /home/user/.ssh → ~/.ssh)
+    home = os.path.expanduser("~")
+    tilde_path = "~" + expanded[len(home):] if expanded.startswith(home) else ""
+    return any(
+        re.search(p, path, re.IGNORECASE)
+        or re.search(p, expanded, re.IGNORECASE)
+        or (tilde_path and re.search(p, tilde_path, re.IGNORECASE))
+        for p in SENSITIVE_PATHS
+    )
 
 
-def is_dangerous_command(command: str) -> tuple[bool, str]:
-    """Check if command contains dangerous patterns."""
-    for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, command, re.IGNORECASE):
-            return True, f"Dangerous pattern detected: {pattern}"
-    return False, ""
+def find_dangerous_pattern(command: str) -> str | None:
+    """Return the first dangerous pattern found in command, or None."""
+    return next(
+        (p for p in DANGEROUS_PATTERNS if re.search(p, command, re.IGNORECASE)),
+        None,
+    )
 
 
 def has_code_danger_patterns(code: str) -> list:
     """Check if code contains dangerous patterns."""
-    found = []
-    for pattern in CODE_DANGER_PATTERNS:
-        if re.search(pattern, code, re.IGNORECASE):
-            found.append(pattern)
-    return found
+    return [p for p in CODE_DANGER_PATTERNS if re.search(p, code, re.IGNORECASE)]
 
 
 # ============================================================================
@@ -144,7 +146,7 @@ def has_code_danger_patterns(code: str) -> list:
 # ============================================================================
 
 def call_claude_for_review(request: dict, script_content: str = "") -> dict:
-    """Call Claude CLI (Haiku) for intelligent security review. Uses subscription quota."""
+    """Call Claude CLI (Opus) for intelligent security review. Uses subscription quota."""
     tool_name = request.get("tool_name", "Unknown")
     tool_input = request.get("tool_input", {})
     cwd = request.get("cwd", "")
@@ -190,11 +192,11 @@ or {{"decision": "deny", "reason": "reason for denial"}}
 
     text = ""  # Initialize for error handling
     try:
-        log_debug("Calling Claude CLI (haiku)...")
+        log_debug("Calling Claude CLI (opus)...")
 
         # Call claude CLI with print mode
         result = subprocess.run(
-            ["claude", "-p", prompt, "--model", "haiku", "--output-format", "text"],
+            ["claude", "-p", prompt, "--model", "opus", "--output-format", "text"],
             capture_output=True,
             text=True,
             timeout=30
@@ -237,6 +239,12 @@ or {{"decision": "deny", "reason": "reason for denial"}}
         return {"decision": "ask", "reason": f"Review error: {e}"}
 
 
+def review_request(request: dict, script_content: str = "") -> tuple[str, str]:
+    """Call Claude for review and return (decision, reason)."""
+    result = call_claude_for_review(request, script_content)
+    return result.get("decision", "ask"), result.get("reason", "")
+
+
 # ============================================================================
 # Output Functions
 # ============================================================================
@@ -268,13 +276,32 @@ def deny(reason: str):
     sys.exit(0)
 
 
+def play_notification_sound():
+    """Play a notification sound on Linux to alert the user."""
+    if not sys.platform.startswith("linux"):
+        log_debug("Skipping sound: not Linux")
+        return
+    try:
+        proc = subprocess.Popen(
+            ["paplay", "/usr/share/sounds/ubuntu/notifications/Mallet.ogg"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log_debug(f"Sound triggered (pid={proc.pid})")
+    except Exception as e:
+        log_debug(f"Sound failed: {e}")
+
+
 def ask_user(context: str = ""):
     """Let user decide (don't return decision).
 
     Args:
         context: Optional context message explaining why user confirmation is needed.
-                 Will be shown via desktop notification on Linux.
+                 Will be shown via desktop notification and sound alert on Linux.
     """
+    # Play notification sound on Linux
+    play_notification_sound()
+
     if context:
         # Send desktop notification on Linux only
         if sys.platform.startswith("linux"):
@@ -294,26 +321,29 @@ def ask_user(context: str = ""):
     sys.exit(0)
 
 
-def handle_claude_decision(decision: str, reason: str, path: str, cwd: str, additional_dirs: list):
-    """Handle Claude's decision with path-aware logic.
+def handle_claude_decision(decision: str, reason: str):
+    """Handle Claude's decision for in-project operations.
 
+    Used only for operations confirmed to be inside the project scope.
     - deny → deny with warning
-    - allow + inside project → allow
-    - allow + outside project → ask user (double confirmation)
+    - allow → allow
     - ask → ask user
     """
     if decision == "deny":
         deny(f"⛔ Claude: {reason}")
     elif decision == "allow":
-        # Check if path is outside project
-        if path and not is_path_in_project(path, cwd, additional_dirs):
-            log_debug(f"Claude approved but path outside project: {path}, asking user")
-            ask_user(f"✅ Claude approved, but path outside project:\n{path}\n\nPlease confirm.")
-        else:
-            allow()
+        allow()
     else:
         log_debug("Claude unsure, asking user")
         ask_user(f"🤔 Claude uncertain: {reason}" if reason else "🤔 Claude needs your decision")
+
+
+def deny_or_ask_user(decision: str, reason: str, ask_message: str):
+    """If Claude denies, deny. Otherwise always ask user (even if Claude allows)."""
+    if decision == "deny":
+        deny(f"⛔ Claude: {reason}")
+    else:
+        ask_user(ask_message)
 
 
 # ============================================================================
@@ -354,124 +384,147 @@ def main():
     # ========================================================================
     # These tools require direct user interaction (e.g. choosing options).
     # Auto-allowing them would bypass user input, so always pass through.
-    USER_INTERACTIVE_TOOLS = ["AskUserQuestion"]
+    USER_INTERACTIVE_TOOLS = ["AskUserQuestion", "ExitPlanMode"]
     if tool_name in USER_INTERACTIVE_TOOLS:
         log_debug(f"User-interactive tool {tool_name}, passing to user directly")
-        ask_user()
+        ask_user(f"🔔 {tool_name} requires your attention")
         return
 
     # ========================================================================
     # PHASE 1: AUTO DENY (fast reject, no API call)
     # ========================================================================
     # Note: AUTO ALLOW is handled by settings.json rules before hook is called
-
-    # 1.1 Dangerous command regex patterns
     if tool_name == "Bash":
         command = tool_input.get("command", "")
-        is_dangerous, reason = is_dangerous_command(command)
-        if is_dangerous:
+        danger = find_dangerous_pattern(command)
+        if danger:
+            reason = f"Dangerous pattern detected: {danger}"
             log_debug(f"Dangerous command detected: {reason}")
             deny(f"⛔ {reason}")
             return
 
     # ========================================================================
-    # PHASE 2: OPUS REVIEW (AI decision)
+    # PATH CLASSIFICATION (collect paths, detect script, classify scope)
     # ========================================================================
 
-    # 2.1 Script execution (python/node/bash + file)
-    if tool_name == "Bash":
-        command = tool_input.get("command", "")
-        script_match = re.search(r'\b(python|python3|node|bash|sh)\s+([^\s;|&]+)', command)
-        if script_match:
-            script_path = script_match.group(2)
-            log_debug(f"Detected script execution: {script_path}")
-
-            # Try to read the script content
-            script_content = ""
-            script_full_path = os.path.expanduser(script_path)
-            try:
-                if not os.path.isabs(script_full_path):
-                    script_full_path = os.path.join(cwd, script_full_path)
-                if os.path.exists(script_full_path):
-                    with open(script_full_path, "r") as f:
-                        script_content = f.read()[:5000]  # Limit to 5000 chars
-                    log_debug(f"Read script content: {len(script_content)} chars")
-                else:
-                    log_debug(f"Script file not found: {script_full_path}")
-            except Exception as e:
-                log_debug(f"Could not read script: {e}")
-
-            log_debug("Calling Claude for script review...")
-            result = call_claude_for_review(request, script_content)
-            decision = result.get("decision", "ask")
-            reason = result.get("reason", "")
-
-            log_debug(f"Claude decision: {decision}, reason: {reason}")
-            handle_claude_decision(decision, reason, script_full_path, cwd, additional_dirs)
-            return
-
-    # 2.2 Write/Edit with dangerous code patterns
-    if tool_name in ("Write", "Edit"):
-        content = tool_input.get("content", "") or tool_input.get("new_string", "")
-        file_path = tool_input.get("file_path", "")
-        danger_patterns = has_code_danger_patterns(content)
-        if danger_patterns:
-            log_debug(f"Dangerous code patterns in Write/Edit: {danger_patterns}")
-            log_debug("Calling Claude for code review...")
-            result = call_claude_for_review(request)
-            decision = result.get("decision", "ask")
-            reason = result.get("reason", "")
-
-            log_debug(f"Claude decision: {decision}, reason: {reason}")
-            handle_claude_decision(decision, reason, file_path, cwd, additional_dirs)
-            return
-
-    # ========================================================================
-    # PHASE 3: CLAUDE REVIEW FOR OTHER CASES
-    # ========================================================================
-    # Instead of directly asking user, let Claude review first
-
-    # 3.1 Collect paths to check
+    # Collect all relevant paths from the request
     paths_to_check = []
     if "file_path" in tool_input:
         paths_to_check.append(tool_input["file_path"])
     if "path" in tool_input:
         paths_to_check.append(tool_input["path"])
 
+    # Detect script execution and read content (used by both Phase 2 and 3)
+    script_content = ""
     if tool_name == "Bash":
         command = tool_input.get("command", "")
+        # Extract paths from Bash command
         path_matches = re.findall(r'(?:^|\s)([~/][^\s;|&<>]+)', command)
         paths_to_check.extend(path_matches)
 
-    # 3.2 Check for sensitive paths - always ask user (even if Claude approves)
-    for path in paths_to_check:
-        if is_sensitive_path(path):
-            log_debug(f"Sensitive path: {path}, calling Claude then asking user")
-            result = call_claude_for_review(request)
-            decision = result.get("decision", "ask")
-            reason = result.get("reason", "")
+        # Detect script execution pattern
+        script_match = re.search(r'\b(python|python3|node|bash|sh)\s+([^\s;|&]+)', command)
+        if script_match:
+            script_path = script_match.group(2)
+            log_debug(f"Detected script execution: {script_path}")
+            script_full_path = os.path.expanduser(script_path)
+            try:
+                if not os.path.isabs(script_full_path):
+                    script_full_path = os.path.join(cwd, script_full_path)
+                if os.path.exists(script_full_path):
+                    with open(script_full_path, "r") as f:
+                        script_content = f.read()[:5000]
+                    log_debug(f"Read script content: {len(script_content)} chars")
+                    # Add script path to paths_to_check
+                    if script_full_path not in paths_to_check:
+                        paths_to_check.append(script_full_path)
+                else:
+                    log_debug(f"Script file not found: {script_full_path}")
+            except Exception as e:
+                log_debug(f"Could not read script: {e}")
 
+    # Classify paths
+    sensitive_path = next(
+        (p for p in paths_to_check if is_sensitive_path(p)),
+        "",
+    )
+    outside_path = next(
+        (p for p in paths_to_check if not is_path_in_project(p, cwd, additional_dirs)),
+        "",
+    )
+
+    log_debug(f"Path classification: sensitive={sensitive_path!r}, outside={outside_path!r}")
+
+    # ========================================================================
+    # PHASE 2: OUTSIDE PROJECT / SENSITIVE PATHS
+    # (Opus reviews ALL content, but user ALWAYS has final say — Claude can only deny)
+    # ========================================================================
+
+    if sensitive_path or outside_path:
+        flagged_path = sensitive_path or outside_path
+        path_label = "Sensitive path" if sensitive_path else "Outside project"
+        path_icon = "⚠️" if sensitive_path else "📁"
+        log_debug(f"{path_label} detected: {flagged_path}")
+
+        # Gather all content context for Opus review
+        review_content = script_content  # Already read for script execution
+
+        # For Write/Edit, include the code being written
+        if tool_name in ("Write", "Edit") and not review_content:
+            code = tool_input.get("content", "") or tool_input.get("new_string", "")
+            if code:
+                review_content = code[:5000]
+                danger_patterns = has_code_danger_patterns(code)
+                if danger_patterns:
+                    log_debug(f"Dangerous code patterns in Write/Edit: {danger_patterns}")
+
+        # Opus reviews with full content context
+        decision, reason = review_request(request, review_content)
+        log_debug(f"Opus decision: {decision}, reason: {reason}")
+
+        # Always ask user for sensitive/outside paths — user has final say
+        notify = f"{path_icon} {path_label}: {flagged_path}"
+        if reason:
+            opus_verdict = "⛔ DENIED" if decision == "deny" else "✅ OK" if decision == "allow" else "❓ Uncertain"
+            notify += f"\n\nOpus ({opus_verdict}): {reason}"
+        ask_user(notify)
+        return
+
+    # ========================================================================
+    # PHASE 3: INSIDE PROJECT (Opus reviews, Claude can auto-approve)
+    # ========================================================================
+
+    # 3.1 Script execution with content inspection
+    if script_content:
+        log_debug("Script execution inside project, Opus reviewing content...")
+        decision, reason = review_request(request, script_content)
+        log_debug(f"Opus decision: {decision}, reason: {reason}")
+        handle_claude_decision(decision, reason)
+        return
+
+    # 3.2 Write/Edit with dangerous code patterns
+    # Writing code is NOT execution — project code may legitimately need
+    # dangerous-looking patterns (cleanup scripts, template engines, etc.).
+    # Opus can approve or escalate to user, but should never deny writing
+    # project code.
+    if tool_name in ("Write", "Edit"):
+        content = tool_input.get("content", "") or tool_input.get("new_string", "")
+        danger_patterns = has_code_danger_patterns(content)
+        if danger_patterns:
+            log_debug(f"Dangerous code patterns in Write/Edit: {danger_patterns}")
+            decision, reason = review_request(request)
+            log_debug(f"Opus decision: {decision}, reason: {reason}")
             if decision == "deny":
-                deny(f"⛔ Claude: {reason}")
-            else:
-                # Even if Claude allows, sensitive paths need user confirmation
-                log_debug("Sensitive path requires user confirmation")
-                ask_user(f"✅ Claude approved, but sensitive path:\n{path}\n\nPlease confirm.")
+                # Downgrade deny to ask — it's code, not execution
+                log_debug("Downgrading deny to ask for code write")
+                decision = "ask"
+                reason = reason or "Code contains potentially dangerous patterns"
+            handle_claude_decision(decision, reason)
             return
 
-    # 3.3 Check if any path is outside project
-    has_outside_path = False
-    outside_path = ""
-    for path in paths_to_check:
-        if not is_path_in_project(path, cwd, additional_dirs):
-            has_outside_path = True
-            outside_path = path
-            break
-
-    # 3.4 For complex Bash commands or unknown operations, let Claude review
+    # 3.3 Complex Bash commands
     if tool_name == "Bash":
         command = tool_input.get("command", "")
-        # Complex command detection: multiple operations, pipes, redirects
         is_complex = (
             "&&" in command or
             "||" in command or
@@ -479,49 +532,28 @@ def main():
             ";" in command or
             len(command) > 100
         )
-        if is_complex or has_outside_path:
-            log_debug(f"Complex Bash or outside path, calling Claude for review...")
-            result = call_claude_for_review(request)
-            decision = result.get("decision", "ask")
-            reason = result.get("reason", "")
-
-            log_debug(f"Claude decision: {decision}, reason: {reason}")
-            handle_claude_decision(decision, reason, outside_path if has_outside_path else "", cwd, additional_dirs)
+        if is_complex:
+            log_debug("Complex Bash inside project, Opus reviewing...")
+            decision, reason = review_request(request)
+            log_debug(f"Opus decision: {decision}, reason: {reason}")
+            handle_claude_decision(decision, reason)
             return
 
-    # 3.5 WebFetch unknown domain - let Claude review
+    # 3.4 WebFetch unknown domain (external network always needs user confirmation)
     if tool_name == "WebFetch":
-        log_debug("Unknown domain, calling Claude for review...")
-        result = call_claude_for_review(request)
-        decision = result.get("decision", "ask")
-        reason = result.get("reason", "")
-
-        log_debug(f"Claude decision: {decision}, reason: {reason}")
-        # WebFetch to unknown domains: if Claude allows, still ask user
-        if decision == "deny":
-            deny(f"⛔ Claude: {reason}")
-        else:
-            url = tool_input.get("url", "unknown")
-            ask_user(f"✅ Claude approved, but unknown domain:\n{url}\n\nPlease confirm.")
+        url = tool_input.get("url", "unknown")
+        log_debug(f"WebFetch unknown domain: {url}")
+        decision, reason = review_request(request)
+        log_debug(f"Opus decision: {decision}, reason: {reason}")
+        deny_or_ask_user(decision, reason,
+                         f"🌐 Unknown domain: {url}\n\nOpus review: {reason or 'no issues found'}")
         return
 
-    # 3.6 Path outside project - let Claude review first
-    if has_outside_path:
-        log_debug(f"Path outside project: {outside_path}, calling Claude for review...")
-        result = call_claude_for_review(request)
-        decision = result.get("decision", "ask")
-        reason = result.get("reason", "")
-
-        log_debug(f"Claude decision: {decision}, reason: {reason}")
-        if decision == "deny":
-            deny(f"⛔ Claude: {reason}")
-        else:
-            ask_user(f"✅ Claude approved, but path outside project:\n{outside_path}\n\nPlease confirm.")
-        return
-
-    # 3.7 Default: simple operations in project - allow
-    log_debug("Simple operation in project scope, allowing")
-    allow()
+    # 3.5 Default: Opus reviews all unmatched requests
+    log_debug("No specific rule matched, Opus reviewing...")
+    decision, reason = review_request(request)
+    log_debug(f"Opus decision: {decision}, reason: {reason}")
+    handle_claude_decision(decision, reason)
 
 
 if __name__ == "__main__":

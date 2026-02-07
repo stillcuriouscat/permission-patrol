@@ -25,7 +25,7 @@ shutil.rmtree("/home/user/important_data")  # 💀 Hidden danger
 - 🔍 **Reads script content** — inspects Python, Node, pytest files before approval
 - 🛡️ **Catches hidden dangers** — `shutil.rmtree()`, `os.remove()`, `rm -rf` buried in code
 - ⚡ **Zero API cost for safe ops** — deterministic rules handle `git`, `ls`, linters
-- 🤖 **AI review for ambiguous cases** — Claude Haiku analyzes complex commands
+- 🤖 **AI review for ambiguous cases** — Claude Opus analyzes complex commands
 - 🔔 **Desktop notifications** — know when Claude approved but needs your confirmation
 - 📦 **No separate API key** — uses your Claude Code subscription quota
 
@@ -42,38 +42,59 @@ Request arrives
     │
     └─ Neither? ──→ permission-guard.py hook
          │
+         ├─ PHASE 0: User-interactive tool? ──→ Ask user (sound + notification)
+         │   (ExitPlanMode, AskUserQuestion)
+         │
          ├─ PHASE 1: Dangerous regex? ──→ Deny immediately
          │   (pipe to nc, encoded exfiltration...)
          │
-         ├─ PHASE 2: Script execution? ──→ Claude reviews script content
-         │   (python xxx.py, pytest, node...)
-         │   ├─ Claude deny ──→ Deny
-         │   ├─ Claude allow + in project ──→ Allow
-         │   └─ Claude allow + outside project ──→ Ask user (double confirm)
+         ├─ PATH CLASSIFICATION ──→ Collect paths, detect scripts, classify scope
+         │   Sensitive path? Outside project? Script content?
          │
-         └─ PHASE 3: Other cases ──→ Claude reviews first
-             ├─ Claude deny ──→ Deny
-             ├─ Claude allow + in project ──→ Allow
-             ├─ Claude allow + sensitive path ──→ Ask user (double confirm)
-             └─ Claude allow + outside project ──→ Ask user (double confirm)
+         ├─ PHASE 2: Outside project / Sensitive path?
+         │   ──→ Opus reviews (with full content context)
+         │   ──→ User ALWAYS has final say (Opus verdict shown in notification)
+         │   Key principle: Opus can inform but NEVER auto-approve outside-project ops
+         │
+         └─ PHASE 3: Inside project
+             │
+             ├─ 3.1 Script execution? ──→ Opus reviews script content
+             │   ├─ Opus deny ──→ Deny
+             │   ├─ Opus allow ──→ Allow
+             │   └─ Opus unsure ──→ Ask user
+             │
+             ├─ 3.2 Write/Edit with dangerous code patterns?
+             │   ──→ Opus reviews (deny downgraded to ask — writing ≠ executing)
+             │
+             ├─ 3.3 Complex Bash (pipes, chains, long commands)?
+             │   ──→ Opus reviews, can auto-approve or deny
+             │
+             ├─ 3.4 WebFetch unknown domain?
+             │   ──→ Opus reviews (can deny, otherwise ask user)
+             │
+             └─ 3.5 Default ──→ Opus reviews, can auto-approve or deny
 ```
 
 ## Features
 
-| Operation | Handling |
-|-----------|----------|
-| Delete files (`rm -rf`, `shred`) | ❌ Deny (settings.json) |
-| Upload data (`curl POST`, `scp`) | ❌ Deny (settings.json) |
-| Pipe to nc (`\| nc host port`) | ❌ Deny (regex) |
-| GitHub delete (`gh repo delete`) | ❌ Deny (settings.json) |
-| Read-only ops (`ls`, `cat`, `Read`) | ✅ Allow (settings.json) |
-| Linters (`ruff`, `mypy`, `eslint`) | ✅ Allow (settings.json) |
-| Trusted domains (`github.com`...) | ✅ Allow (settings.json) |
-| GitHub CLI (`gh *`) | ✅ Allow (settings.json) |
-| Run Python/pytest (in project) | 🤖 Claude reviews → auto allow/deny |
-| Run script (outside project) | 🤖 Claude reviews → user confirms |
-| Sensitive paths (`/etc/`, `~/.ssh/`) | 🤖 Claude reviews → user confirms |
-| Complex Bash commands | 🤖 Claude reviews → auto or user confirms |
+| Operation | Phase | Handling |
+|-----------|-------|----------|
+| ExitPlanMode, AskUserQuestion | Phase 0 | 🔔 Ask user (sound + notification) |
+| Delete files (`rm -rf`, `shred`) | settings.json | ❌ Deny (no API call) |
+| Upload data (`curl POST`, `scp`) | settings.json | ❌ Deny (no API call) |
+| Pipe to nc (`\| nc host port`) | Phase 1 | ❌ Deny (regex, no API call) |
+| GitHub delete (`gh repo delete`) | settings.json | ❌ Deny (no API call) |
+| Read-only ops (`ls`, `cat`, `Read`) | settings.json | ✅ Allow (no API call) |
+| Linters (`ruff`, `mypy`, `eslint`) | settings.json | ✅ Allow (no API call) |
+| Trusted domains (`github.com`...) | settings.json | ✅ Allow (no API call) |
+| GitHub CLI (`gh *`) | settings.json | ✅ Allow (no API call) |
+| Sensitive paths (`/etc/`, `~/.ssh/`) | Phase 2 | 🤖 Opus reviews → user always decides |
+| Outside project paths | Phase 2 | 🤖 Opus reviews → user always decides |
+| Run script (in project) | Phase 3.1 | 🤖 Opus reviews content → auto allow/deny |
+| Write/Edit dangerous code (in project) | Phase 3.2 | 🤖 Opus reviews → deny downgraded to ask |
+| Complex Bash (in project) | Phase 3.3 | 🤖 Opus reviews → auto allow/deny |
+| WebFetch unknown domain | Phase 3.4 | 🤖 Opus reviews → deny or ask user |
+| Other unmatched requests | Phase 3.5 | 🤖 Opus reviews → auto allow/deny |
 
 ## Why Command Hook?
 
@@ -87,7 +108,7 @@ Claude Code supports two types of hooks for AI-powered review:
 
 **The key difference:** `prompt` hooks can only see the command string (e.g., `python3 script.py`). They cannot read what's inside `script.py`.
 
-Permission Patrol uses a `command` hook that calls Claude CLI, so it can **read the actual script content** before deciding. This catches dangerous code like:
+Permission Patrol uses a `command` hook that calls Claude CLI (Opus), so it can **read the actual script content** before deciding. This catches dangerous code like:
 
 ```python
 # script.py looks innocent as a command, but contains:
@@ -153,42 +174,59 @@ Add the `allow` and `deny` rules from `permissions.json` to your `~/.claude/sett
 
 | File | Description |
 |------|-------------|
-| `permission-guard.py` | Main hook script - calls Claude CLI for intelligent review |
+| `permission-guard.py` | Main hook script — 4-phase security review using Claude Opus |
 | `permissions.json` | Reference allow/deny rules to merge into settings.json |
+| `test_permission_guard.py` | 62 unit tests covering all phases and edge cases |
 
-## How Claude Reviews Scripts
+## How Opus Reviews Scripts
 
 When you run `python3 script.py` or `pytest`:
 
-1. Hook reads the script file content
-2. Sends content + request info to Claude CLI (Haiku)
-3. Claude checks for:
+1. Hook reads the script file content (up to 5000 chars)
+2. Classifies paths: sensitive? outside project?
+3. Sends content + request info to Claude CLI (Opus, using subscription quota)
+4. Opus checks for:
    - File deletion (`shutil.rmtree`, `os.remove`)
    - Data upload (`requests.post`, socket connections)
    - Credential access (`~/.ssh`, `.env`)
    - Command injection patterns
-4. Returns: `allow` / `deny` / `ask`
+5. Returns: `allow` / `deny` / `ask`
+
+**Key principle:** For scripts outside the project or touching sensitive paths (Phase 2), Opus verdict is advisory — the user always makes the final decision. For scripts inside the project (Phase 3), Opus can auto-approve or auto-deny.
 
 ## Debug Logging
 
-Logs are written to `/tmp/permission-guard.log`:
+Logs are written to `~/.local/state/permission-patrol/permission-guard.log`:
 
 ```bash
-tail -f /tmp/permission-guard.log
+tail -f ~/.local/state/permission-patrol/permission-guard.log
 ```
 
 ## Desktop Notifications (Linux)
 
-On Linux, when Claude approves but user confirmation is still needed (outside project / sensitive path), a desktop notification is sent via `notify-send`:
+On Linux, `ask_user()` triggers both:
+- **Sound alert** via `paplay` (Ubuntu notification sound)
+- **Desktop notification** via `notify-send` with context about the request
+
+Examples of notification content:
 
 ```
-✅ Claude approved, but path outside project:
-/etc/hostname
-
-Please confirm.
+🔔 ExitPlanMode requires your attention
 ```
 
-This helps you know Claude has already reviewed the request before you see the confirmation dialog.
+```
+📁 Outside project: /etc/hostname
+
+Opus (✅ OK): Reading hostname is a safe read-only operation
+```
+
+```
+⚠️ Sensitive path: ~/.ssh/config
+
+Opus (⛔ DENIED): Writing to SSH config could compromise security
+```
+
+The Opus verdict is shown for reference, but the user always makes the final decision for Phase 2 requests. `deny()` does NOT trigger sound or notification — there's nothing for the user to act on.
 
 ## Customization
 
